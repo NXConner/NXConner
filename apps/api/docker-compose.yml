@@ -1,0 +1,113 @@
+﻿version: '3.9'
+
+services:
+  # PostgreSQL Database Service
+  postgres:
+    image: postgis/postgis:15-3.3
+    container_name: blacktop-blackout-db
+    environment:
+      POSTGRES_DB: blacktop_blackout
+      POSTGRES_USER: blacktop_admin
+      POSTGRES_PASSWORD: 
+      PGDATA: /var/lib/postgresql/data
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ../schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U blacktop_admin -d blacktop_blackout"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis for Caching and Session Management
+  redis:
+    image: redis:7.0-alpine
+    container_name: blacktop-blackout-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Backend API Service
+  api:
+    build:
+      context: ../..
+      dockerfile: apps/api/Dockerfile
+      target: development
+    container_name: blacktop-blackout-api
+    environment:
+      - NODE_ENV=development
+      - PORT=3000
+      - DATABASE_URL=postgresql://blacktop_admin:@postgres:5432/blacktop_blackout
+      - REDIS_URL=redis://redis:6379
+      - JWT_SECRET=
+      - CORS_ORIGIN=http://localhost:4200
+    ports:
+      - "3000:3000"
+      - "9229:9229"  # Debugging port
+    volumes:
+      - .:/app/apps/api
+      - /app/apps/api/node_modules
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Supabase Studio (Optional Database Management)
+  supabase-studio:
+    image: supabase/studio:latest
+    container_name: blacktop-blackout-supabase-studio
+    environment:
+      SUPABASE_URL: http://postgres:5432
+      POSTGRES_PASSWORD: 
+    ports:
+      - "3001:3000"
+    depends_on:
+      - postgres
+
+  # Prometheus for Monitoring
+  prometheus:
+    image: prom/prometheus:v2.44.0
+    container_name: blacktop-blackout-prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+
+  # Grafana for Visualization
+  grafana:
+    image: grafana/grafana:9.5.3
+    container_name: blacktop-blackout-grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=
+    volumes:
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3002:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  postgres-data:
+  redis-data:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  default:
+    name: blacktop-blackout-network
+    driver: bridge
