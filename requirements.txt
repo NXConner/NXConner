@@ -1,0 +1,4 @@
+tqdm>=4.66.4
+python-magic>=0.4.27
+Pillow>=10.4.0
+PySimpleGUI>=4.60.5
