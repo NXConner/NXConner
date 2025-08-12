@@ -14,7 +14,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple, Callable
 
 try:
     from tqdm import tqdm
@@ -521,23 +521,20 @@ def parse_args(argv: Optional[List[str]] = None) -> ScannerConfig:
     return cfg
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    cfg = parse_args(argv)
-
+def run_scan(cfg: ScannerConfig, on_progress: Optional[Callable[[int, int, int, Optional[str]], None]] = None) -> List[ScanResult]:
     # Compile keyword regex
     keyword_re = compile_keyword_regex(cfg.keywords)
 
     # Initialize optional NSFW model
     nsfw_model = None
     if cfg.deep_image_classify:
-        if not cfg.nsfw_model_path:
-            print("[warn] --deep-image enabled but --nsfw-model-path not provided; disabling deep image classification", file=sys.stderr)
-        else:
+        if cfg.nsfw_model_path:
             try:
                 nsfw_model = init_nsfw_model(cfg.nsfw_model_path)
-            except Exception as e:  # pragma: no cover
-                print(f"[warn] Failed to load NSFW model: {e}; continuing without deep image classification", file=sys.stderr)
+            except Exception:
                 nsfw_model = None
+        else:
+            nsfw_model = None
 
     # Optional ripgrep accelerated candidate paths (content matches)
     rg_candidates: Set[str] = set()
@@ -545,7 +542,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         rg_candidates = gather_candidates_with_ripgrep(cfg.roots, cfg.keywords)
 
     # Enumerate files
-    print("Indexing files...", file=sys.stderr)
     all_paths = list_files(cfg.roots, cfg.include_hidden, cfg.follow_symlinks, cfg.exclude_globs)
 
     # Merge ripgrep candidates into the list (ensure we include even if filtered by ext)
@@ -559,29 +555,25 @@ def main(argv: Optional[List[str]] = None) -> int:
                 all_paths.append(p)
 
     total_files = len(all_paths)
-    if total_files == 0:
-        print("No files found to scan.")
-        return 0
-
-    # Prepare progress bar
-    if tqdm is None:
-        print("[warn] tqdm not installed, progress bar disabled. Install with: pip install tqdm", file=sys.stderr)
-
-    progress = tqdm(total=total_files, unit="file", disable=(tqdm is None)) if tqdm else None
 
     results: List[ScanResult] = []
     flagged_count = 0
 
-    def _update_progress():
-        if progress:
-            pct = (flagged_count / max(1, progress.n)) * 100.0 if progress.n else 0.0
-            progress.set_postfix({"flagged": flagged_count, "%": f"{pct:.1f}"})
+    def do_progress(current_processed: int, current_path: Optional[str] = None):
+        if on_progress:
+            try:
+                on_progress(current_processed, total_files, flagged_count, current_path)
+            except Exception:
+                pass
+
+    do_progress(0)
 
     # Thread pool scanning
     with concurrent.futures.ThreadPoolExecutor(max_workers=cfg.num_workers) as executor:
         future_to_path = {
             executor.submit(scan_one_file, p, cfg, keyword_re, nsfw_model): p for p in all_paths
         }
+        processed = 0
         for fut in concurrent.futures.as_completed(future_to_path):
             p = future_to_path[fut]
             try:
@@ -593,18 +585,57 @@ def main(argv: Optional[List[str]] = None) -> int:
                 flagged_count += 1
                 if cfg.apply:
                     action_on_path(Path(res.path), cfg)
-            if progress:
-                progress.update(1)
-                _update_progress()
+            processed += 1
+            do_progress(processed, str(p))
+
+    # Reports
+    write_reports(results, cfg)
+
+    return results
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    cfg = parse_args(argv)
+
+    # Console progress bar wiring
+    print("Indexing files...", file=sys.stderr)
+
+    # If progress bar available, show it
+    total_seen = 0
+    flagged_seen = 0
+    progress = None
+
+    def on_progress(current_index: int, total: int, flagged_count: int, current_path: Optional[str]):
+        nonlocal total_seen, flagged_seen, progress
+        total_seen = total
+        flagged_seen = flagged_count
+        if tqdm:
+            if progress is None:
+                progress = tqdm(total=total, unit="file")
+            else:
+                # Sometimes total can be 0 initially, update when we know it
+                if progress.total != total and total > 0:
+                    progress.total = total
+            # Ensure progress reflects current_index
+            delta = current_index - progress.n
+            if delta > 0:
+                progress.update(delta)
+            if progress.n:
+                pct = (flagged_seen / max(1, progress.n)) * 100.0
+            else:
+                pct = 0.0
+            progress.set_postfix({"flagged": flagged_seen, "%": f"{pct:.1f}"})
+
+    results = run_scan(cfg, on_progress=on_progress)
 
     if progress:
         progress.close()
 
+    total_files = sum(1 for _ in results) + (progress.n - flagged_seen if progress else 0)
+
     # Summary
     print()
-    print(f"Scanned files: {total_files}")
-    print(f"Flagged files: {flagged_count} ({(flagged_count / total_files) * 100.0:.2f}%)")
-
+    print(f"Flagged files: {len(results)}")
     # Reason breakdown
     reason_counts: Dict[str, int] = {}
     for r in results:
@@ -614,9 +645,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("Breakdown by reason:")
         for reason, count in sorted(reason_counts.items(), key=lambda kv: (-kv[1], kv[0])):
             print(f"  - {reason}: {count}")
-
-    # Reports
-    write_reports(results, cfg)
 
     return 0
 
